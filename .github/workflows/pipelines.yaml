@@ -1,0 +1,382 @@
+name: pipeline for web3
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+env:
+  CONTRACT_DIRECTORY: ./truffle
+  CLIENT_DIRECTORY: ./client
+  API_DIRECTORY: ./api
+  IAC_DIRECTORY: ./iac
+  RESOURCE_GROUP: Web3DevOps
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      # compile and test
+      - uses: actions/checkout@v3
+
+      # contracts
+      - name: Install Truffle
+        working-directory: ${{ env.CONTRACT_DIRECTORY }}
+        run: npm install
+      - name: Compile contracts
+        working-directory: ${{ env.CONTRACT_DIRECTORY }}
+        run: npx truffle compile
+      - name: Test contracts
+        working-directory: ${{ env.CONTRACT_DIRECTORY }}
+        run: npx truffle test
+      - name: Publish contract test results
+        uses: actions/upload-artifact@v3
+        with:
+          name: Contracts_Test_Results
+          path: ${{ env.CONTRACT_DIRECTORY }}/TEST-results.xml
+      - name: Publish tests
+        uses: actions/upload-artifact@v3
+        with:
+          name: pipeline_contract_tests
+          path: |
+            ${{ env.CONTRACT_DIRECTORY }}/test/**
+            ${{ env.CONTRACT_DIRECTORY }}/package.json
+      - name: Publish contracts
+        uses: actions/upload-artifact@v3
+        with:
+          name: pipeline_contracts
+          path: |
+            ${{ env.CONTRACT_DIRECTORY }}/package.json
+            ${{ env.CONTRACT_DIRECTORY }}/migrations/**
+            ${{ env.CONTRACT_DIRECTORY }}/truffle-config.js
+            ${{ env.CLIENT_DIRECTORY }}/src/contracts/**
+
+      # frontend
+      - name: Install client dependencies
+        working-directory: ${{ env.CLIENT_DIRECTORY }}
+        run: npm install
+      - name: Build client
+        working-directory: ${{ env.CLIENT_DIRECTORY }}
+        run: npm run build
+      - name: Test client
+        working-directory: ${{ env.CLIENT_DIRECTORY }}
+        run: npm test -- --reporters=default --reporters=jest-junit
+        env:
+          CI: true
+      - name: Publish client test results
+        uses: actions/upload-artifact@v3
+        with:
+          name: Client_Test_Results
+          path: ${{ env.CLIENT_DIRECTORY }}/junit.xml
+      - name: Publish client
+        uses: actions/upload-artifact@v3 
+        with:
+          name: pipeline_client
+          path: ${{ env.CLIENT_DIRECTORY }}/build
+
+      # api
+      - name: Publish API
+        uses: actions/upload-artifact@v3
+        with:
+          name: pipeline_api
+          path: ${{ env.API_DIRECTORY }}
+      - name: Install API dependencies
+        working-directory: ${{ env.API_DIRECTORY }}
+        run: npm install
+      - name: Test API
+        working-directory: ${{ env.API_DIRECTORY }}
+        run: npm test -- --reporters=default --reporters=jest-junit
+        env: 
+          CI: true
+          networkAddress_4: "0x7a063c7e4A0EC2fB4dC0F73103Fd45F17b46Ae52"
+      - name: Publish API test results
+        uses: actions/upload-artifact@v3
+        with:
+          name: API_Test_Results
+          path: ${{ env.API_DIRECTORY }}/junit.xml
+
+      # iac
+      - name: Publish IaC
+        uses: actions/upload-artifact@v3
+        with:
+          name: pipeline_iac
+          path: ${{ env.IAC_DIRECTORY }}
+
+  dev:
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - name: Login Azure
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+          enable-AzPSSession: true 
+
+      # deploy iac                                         
+      - name: Download IaC artifacts
+        uses: actions/download-artifact@v3
+        with:
+          name: pipeline_iac
+          path: ${{ env.IAC_DIRECTORY }}
+      - name: Deploy Infra
+        uses: azure/powershell@v1
+        with:
+          azPSVersion: "latest"
+          inlineScript: |
+            Set-Location .\iac
+            .\deploy.ps1 -rgName ${{ env.RESOURCE_GROUP }}-dev -fqdn ${{ env.RESOURCE_GROUP }}-dev -repoUrl ${{ github.server_url }}/${{ github.repository }} -deployGanache -verbose
+            Set-Location ..
+
+      # deploy contracts
+      - name: Download contracts artifacts
+        uses: actions/download-artifact@v3
+        with:
+          name: pipeline_contracts
+      - name: Install Truffle
+        working-directory: ${{ env.CONTRACT_DIRECTORY }}
+        run: npm install
+      # Before deploying the contracts restart the container. If you don't
+      # the same container could be running for days and the logs will no 
+      # longer have the accounts and private keys in them.
+      - name: deploy_contracts => Restart Ganache
+        uses: azure/powershell@v1
+        with:
+          azPSVersion: "latest"
+          inlineScript: |
+            Write-Host "ganacheName: ${{ env.ganacheName }}"
+            Write-Host "resourceGroup: ${{ env.RESOURCE_GROUP }}-dev"
+            az container restart --resource-group ${{ env.RESOURCE_GROUP }}-dev --name ${{ env.ganacheName }}
+      - name: Deploy contracts
+        working-directory: ${{ env.CONTRACT_DIRECTORY }}
+        run: npx truffle migrate --network development --reset --compile-none
+        env:  
+          DEV_NETWORK: ${{ env.ganacheIp }}
+      - name: Find contract address
+        uses: azure/powershell@v1
+        with:
+          azPSVersion: "latest"
+          inlineScript: |
+            # Load the contract JSON that should have a single network property
+            # after the contract migration above
+            $contract = Get-Content .\client\src\contracts\SimpleStorage.json | ConvertFrom-Json
+
+            # The networkId is the name of the only property in the networks object
+            $networkId = $contract.networks[0] | Get-Member -MemberType NoteProperty | Select-Object -ExpandProperty name
+
+            # Get the address property
+            $address = $contract.networks.$networkId.address
+
+            if ($address) {
+                Write-Host "Contract address: $address"
+            } else {
+                Write-Host "Address not found"
+            }
+            
+            Add-Content -Path $env:GITHUB_ENV -value "networkId=$networkId"
+            Add-Content -Path $env:GITHUB_ENV -value "contractAddress=$address"
+
+      # deploy frontend
+      - name: Download client artifacts
+        uses: actions/download-artifact@v3
+        with:
+          name: pipeline_client
+          path: ${{ env.CLIENT_DIRECTORY }}
+      - name: Download API artifacts
+        uses: actions/download-artifact@v3
+        with:
+          name: pipeline_api
+          path: ${{ env.API_DIRECTORY }}
+      - name: Deploy frontend
+        id: deploy_swa
+        uses: Azure/static-web-apps-deploy@v1
+        with:
+          azure_static_web_apps_api_token: ${{ env.deploymentToken }}
+          action: "upload"
+          app_location: "client" # App source code path relative to repository root
+          api_location: "api" # Api source code path relative to repository root - optional
+          skip_app_build: true
+      - name: Configure API
+        uses: azure/powershell@v1
+        with:
+          azPSVersion: "latest"
+          inlineScript: |
+            az staticwebapp appsettings set --name ${{ env.swaName }} --setting-names networkAddress=${{ env.contractAddress }} networkAddress_${{ env.networkId }}=${{ env.contractAddress }}
+      - name: Update summary
+        uses: azure/powershell@v1
+        with:
+          azPSVersion: "latest"
+          inlineScript: |
+            dir env: | Out-String
+            Write-Host "ganacheIp: ${{ env.ganacheIp }}"
+            Write-Host "ganacheFqdn: ${{ env.ganacheFqdn }}"
+            Write-Host "ganacheName: ${{ env.ganacheName }}"
+            Write-Host "resourceGroup: ${{ env.RESOURCE_GROUP }}"
+            $logs = az container logs --container ganache --resource-group ${{ env.RESOURCE_GROUP }}-dev --name ${{ env.ganacheName }}
+            Write-Host "logs: $logs"
+            # Get first address
+            $address = ($logs | Select-String '\(0\) ([^\(]+) \(').Matches.Groups[1].Value 
+            # Get first private key
+            $key = ($logs | Select-String '\(0\) ([^\(]{64,})').Matches.Groups[1].Value
+            # Get swaUrl
+            $swaUrl = "${{ steps.deploy_swa.outputs.static_web_app_url }}"
+            $summaryPath = Join-Path -Path $env:GITHUB_WORKSPACE -ChildPath truffle | Join-Path -ChildPath contracts | Join-Path -ChildPath Contract_Information.md
+            Write-Host "Writing summary to $summaryPath"
+            $data = @"
+            ### SPA Information
+            App URL: [$swaUrl]($swaUrl)
+            ### Contract Information
+            Ganache IP: [http://${{ env.ganacheIp }}:8545](http://${{ env.ganacheIp }}:8545)
+            Ganache FQDN: [http://${{ env.ganacheFqdn }}:8545](http://${{ env.ganacheFqdn }}:8545)
+            Network ID: ${{ env.networkId }}
+            Contract Address: ${{ env.contractAddress }}
+            ### Account Information
+            Address: $address
+            Private Key: $key
+            "@
+            Set-Content -Path $env:GITHUB_STEP_SUMMARY -Value $data -Verbose
+
+  dev_validation:
+    runs-on: ubuntu-latest
+    needs: dev
+    steps:
+      - name: wait_for_dev_validation
+        run: echo "success"
+      - name: delete_dev
+        run: echo "success"
+  
+  qa:
+    runs-on: ubuntu-latest
+    needs: dev_validation
+    steps:
+      - name: Login Azure
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+          enable-AzPSSession: true 
+      
+      # deploy iac                                         
+      - name: Download IaC artifacts
+        uses: actions/download-artifact@v3
+        with:
+          name: pipeline_iac
+          path: ${{ env.IAC_DIRECTORY }}
+      - name: Deploy Infra
+        uses: azure/powershell@v1
+        with:
+          azPSVersion: "latest"
+          inlineScript: |
+            Set-Location .\iac
+            .\deploy.ps1 -rgName ${{ env.RESOURCE_GROUP }}-qa -fqdn '' -repoUrl ${{ github.server_url }}/${{ github.repository }} -verbose
+            Set-Location ..
+
+      # deploy contracts to Goerli test net
+      - name: Download contracts artifacts
+        uses: actions/download-artifact@v3
+        with:
+          name: pipeline_contracts
+      - name: Install Truffle
+        working-directory: ${{ env.CONTRACT_DIRECTORY }}
+        run: npm install
+      - name: Deploy contracts
+        working-directory: ${{ env.CONTRACT_DIRECTORY }}
+        run: npx truffle migrate --network sepolia --reset --compilie-none
+        env: 
+          MNEMONIC: ${{ secrets.MNEMONIC }}
+          API_KEY: ${{ secrets.API_KEY }}
+      - name: Find contract address
+        uses: azure/powershell@v1
+        with:
+          azPSVersion: "latest"
+          inlineScript: |
+            # Load the contract JSON that should have a single network property
+            # after the contract migration above
+            $contract = Get-Content .\client\src\contracts\SimpleStorage.json | ConvertFrom-Json
+
+            # The networkId is the name of the only property in the networks object
+            $networkId = $contract.networks[0] | Get-Member -MemberType NoteProperty | Select-Object -ExpandProperty name
+
+            # Get the address property
+            $address = $contract.networks.$networkId.address
+
+            if ($address) {
+                Write-Host "Contract address: $address"
+            } else {
+                Write-Host "Address not found"
+            }
+
+            Add-Content -Path $env:GITHUB_ENV -value "networkId=$networkId"
+            Add-Content -Path $env:GITHUB_ENV -value "contractAddress=$address"
+
+      # deploy frontend
+      - name: Download client artifacts
+        uses: actions/download-artifact@v3
+        with:
+          name: pipeline_client
+          path: ${{ env.CLIENT_DIRECTORY }}
+      - name: Download API artifacts
+        uses: actions/download-artifact@v3
+        with:
+          name: pipeline_api
+          path: ${{ env.API_DIRECTORY }}
+      - name: Deploy frontend
+        id: deploy_swa
+        uses: Azure/static-web-apps-deploy@v1
+        with:
+          azure_static_web_apps_api_token: ${{ env.deploymentToken }}
+          action: "upload"
+          app_location: "client" # App source code path relative to repository root
+          api_location: "api" # Api source code path relative to repository root - optional
+          skip_app_build: true
+      - name: Configure API
+        uses: azure/powershell@v1
+        with:
+          azPSVersion: "latest"
+          inlineScript: |
+            az staticwebapp appsettings set --name ${{ env.swaName }} --setting-names networkAddress=${{ env.contractAddress }} networkAddress_${{ env.networkId }}=${{ env.contractAddress }}
+      - name: Update summary
+        uses: azure/powershell@v1
+        with:
+          azPSVersion: "latest"
+          inlineScript: |
+            dir env: | Out-String
+
+            Write-Host "resourceGroup: ${{ env.RESOURCE_GROUP }}"
+
+            # Get swaUrl
+            $swaUrl = "${{ steps.deploy_swa.outputs.static_web_app_url }}"
+            
+            $summaryPath = Join-Path -Path $env:GITHUB_WORKSPACE -ChildPath truffle | Join-Path -ChildPath contracts | Join-Path -ChildPath Contract_Information.md
+            Write-Host "Writing summary to $summaryPath"
+            
+            $data = @"
+            ### SPA Information
+            App URL: [$swaUrl]($swaUrl)
+
+            ### Contract Information
+            Network ID: ${{ env.networkId }}
+            Contract Address: ${{ env.contractAddress }}
+            "@
+            Set-Content -Path $env:GITHUB_STEP_SUMMARY -Value $data -Verbose
+  
+  qa_validation:
+    runs-on: ubuntu-latest
+    needs: qa
+    steps:
+      - name: wait_for_qa_validation
+        run: echo "success"
+      - name: delete_qa
+        run: echo "success"
+    
+  prod:
+    runs-on: ubuntu-latest
+    needs: qa_validation
+    steps:
+      - name: iac
+        run: echo "success"
+      - name: deploy_contracts
+        run: echo "success"
+      - name: deploy_frontend
+        run: echo "success"
